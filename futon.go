@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -36,6 +37,7 @@ type futon struct {
 	folderCacheLock   sync.RWMutex
 	unmounted         int32
 	conn              *fuse.Conn
+	client            *http.Client
 
 	Token *oauth.Token
 }
@@ -147,7 +149,8 @@ func (self *futon) authorize() (err error) {
 		Token:     self.Token,
 		Transport: http.DefaultTransport,
 	}
-	if self.drive, err = drive.New(transport.Client()); err != nil {
+	self.client = transport.Client()
+	if self.drive, err = drive.New(self.client); err != nil {
 		return
 	}
 
@@ -180,10 +183,15 @@ type node interface {
 	Path() path
 	Futon() *futon
 	Id() string
+	Size() int64
 }
 
 func (self *nodeImpl) Id() string {
 	return self.id
+}
+
+func (self *nodeImpl) Size() int64 {
+	return self.size
 }
 
 var uid uint32
@@ -253,6 +261,51 @@ type dir struct {
 	children     []node
 	childByName  map[string]node
 	childrenLock sync.RWMutex
+}
+
+type file struct {
+	node
+}
+
+func (self *file) Read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, intr fs.Intr) (ferr fuse.Error) {
+	if self.Size() == 0 {
+		return
+	}
+	f, err := self.Futon().drive.Files.Get(self.Id()).Do()
+	if err != nil {
+		log.Printf("%v", err)
+		ferr = fuse.Error(err)
+		return
+	}
+	if f.DownloadUrl == "" {
+		return
+	}
+	req, err := http.NewRequest("GET", f.DownloadUrl, nil)
+	if err != nil {
+		log.Printf("%v", err)
+		ferr = fuse.Error(err)
+		return
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%v-%v", readReq.Offset, readReq.Offset+int64(readReq.Size)))
+	resp, err := self.Futon().client.Do(req)
+	if err != nil {
+		log.Printf("%v", err)
+		ferr = fuse.Error(err)
+		return
+	}
+	if resp.StatusCode != 206 {
+		log.Printf("%+v", resp)
+		ferr = fuse.Error(fmt.Errorf("While trying to download %#v: %+v", f.DownloadUrl, resp))
+		return
+	}
+	defer resp.Body.Close()
+	if readResp.Data, err = ioutil.ReadAll(resp.Body); err != nil {
+		log.Printf("%v", err)
+		ferr = fuse.Error(err)
+		return
+	}
+	log.Printf("got %+v\n%#v", resp, readResp.Data)
+	return
 }
 
 func (self *futon) newNode(path path, f *drive.File) (result node) {
@@ -424,10 +477,6 @@ func (self *dir) ReadDir(intr fs.Intr) (result []fuse.Dirent, ferr fuse.Error) {
 		result[index] = ent
 	}
 	return
-}
-
-type file struct {
-	node
 }
 
 func (self *futon) Root() (result fs.Node, err fuse.Error) {
