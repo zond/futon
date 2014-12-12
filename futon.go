@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,8 +52,9 @@ var config = &oauth.Config{
 
 func (self *futon) changeList() (result []*drive.Change, err error) {
 	var changeLoader func(string) error
+	newLastChange := int64(0)
 	changeLoader = func(pageToken string) (err error) {
-		call := self.drive.Changes.List().StartChangeId(self.lastChange)
+		call := self.drive.Changes.List().StartChangeId(self.lastChange).IncludeDeleted(true)
 		if pageToken != "" {
 			call = call.PageToken(pageToken)
 		}
@@ -61,8 +64,10 @@ func (self *futon) changeList() (result []*drive.Change, err error) {
 		}
 		for _, change := range changes.Items {
 			changeCopy := change
-			self.lastChange = changeCopy.Id
-			result = append(result, changeCopy)
+			newLastChange = changeCopy.Id
+			if changeCopy.Id != self.lastChange {
+				result = append(result, changeCopy)
+			}
 		}
 		if changes.NextPageToken != "" {
 			if err = changeLoader(changes.NextPageToken); err != nil {
@@ -74,19 +79,25 @@ func (self *futon) changeList() (result []*drive.Change, err error) {
 	if err = changeLoader(""); err != nil {
 		return
 	}
+	self.lastChange = newLastChange
 	return
 }
 
 func (self *futon) cleanChanges() (err error) {
-	start := time.Now()
 	changes, err := self.changeList()
 	if err != nil {
 		return
 	}
+	self.folderCacheLock.Lock()
+	defer self.folderCacheLock.Unlock()
 	for _, change := range changes {
-		log.Printf("%+v\n", change)
+		for _, parent := range change.File.Parents {
+			if d, found := self.folderCacheById[parent.Id]; found {
+				fmt.Println("cleaning", d.Path(), "since", change.File.Title, "was changed")
+				d.clearChildren()
+			}
+		}
 	}
-	log.Printf("changes: %v", time.Since(start))
 	return
 }
 
@@ -152,18 +163,21 @@ func (self *futon) authorize() (err error) {
 
 type nodeImpl struct {
 	futon *futon
-	path  string
+	path  path
 	id    string
 	mode  os.FileMode
+	size  int64
+	atime time.Time
+	mtime time.Time
 }
 
-func (self *nodeImpl) Path() string {
+func (self *nodeImpl) Path() path {
 	return self.path
 }
 
 type node interface {
 	fs.Node
-	Path() string
+	Path() path
 	Futon() *futon
 	Id() string
 }
@@ -172,8 +186,62 @@ func (self *nodeImpl) Id() string {
 	return self.id
 }
 
+var uid uint32
+var gid uint32
+
+func init() {
+	user, err := user.Current()
+	if err == nil {
+		uidint, _ := strconv.Atoi(user.Uid)
+		gidint, _ := strconv.Atoi(user.Gid)
+		uid = uint32(uidint)
+		gid = uint32(gidint)
+	}
+}
+
+type path []string
+
+func (self path) add(el string) (result path) {
+	result = make(path, len(self)+1)
+	copy(result, self)
+	result[len(result)-1] = el
+	return
+}
+
+func (self path) String() (result string) {
+	for index, el := range self {
+		result += strings.Replace(el, "/", "\u2215", -1)
+		if index < len(self)-1 {
+			result += "/"
+		}
+	}
+	return
+}
+
+func (self path) base() string {
+	return strings.Replace(self[len(self)-1], "/", "\u2215", -1)
+}
+
+func (self path) dir() (result string) {
+	for index, el := range self[:len(self)-1] {
+		result += strings.Replace(el, "/", "\u2215", -1)
+		if index < len(self)-2 {
+			result += "/"
+		}
+	}
+	return
+}
+
 func (self *nodeImpl) Attr() fuse.Attr {
-	return fuse.Attr{Mode: self.mode}
+	return fuse.Attr{
+		Mode:  self.mode,
+		Size:  uint64(self.size),
+		Uid:   uid,
+		Gid:   gid,
+		Atime: self.atime,
+		Mtime: self.mtime,
+		Ctime: self.mtime,
+	}
 }
 
 func (self *nodeImpl) Futon() *futon {
@@ -182,24 +250,43 @@ func (self *nodeImpl) Futon() *futon {
 
 type dir struct {
 	node
-	children    []node
-	childByName map[string]node
+	children     []node
+	childByName  map[string]node
+	childrenLock sync.RWMutex
 }
 
-func (self *futon) newDir(path, id string, mode os.FileMode) (result *dir) {
-	result = &dir{
-		childByName: map[string]node{},
-		node: &nodeImpl{
-			futon: self,
-			path:  path,
-			id:    id,
-			mode:  os.ModeDir | 0777,
-		},
+func (self *futon) newNode(path path, f *drive.File) (result node) {
+	atime, _ := time.Parse(time.RFC3339, f.LastViewedByMeDate)
+	mtime, _ := time.Parse(time.RFC3339, f.ModifiedDate)
+	base := &nodeImpl{
+		futon: self,
+		path:  path,
+		id:    f.Id,
+		mode:  os.FileMode(0400),
+		size:  f.FileSize,
+		atime: atime,
+		mtime: mtime,
 	}
-	self.folderCacheLock.Lock()
-	defer self.folderCacheLock.Unlock()
-	self.folderCacheByPath[path] = result
-	self.folderCacheById[result.Id()] = result
+	if f.UserPermission.Type == "owner" || f.UserPermission.Type == "writer" {
+		base.mode |= 0200
+	}
+	if f.MimeType == "application/vnd.google-apps.folder" {
+		base.mode |= 0100
+		base.mode |= os.ModeDir
+		d := &dir{
+			childByName: map[string]node{},
+			node:        base,
+		}
+		self.folderCacheLock.Lock()
+		defer self.folderCacheLock.Unlock()
+		self.folderCacheByPath[base.Path().String()] = d
+		self.folderCacheById[base.Id()] = d
+		result = d
+	} else {
+		result = &file{
+			node: base,
+		}
+	}
 	return
 }
 
@@ -213,7 +300,8 @@ func (self *dir) Lookup(name string, intr fs.Intr) (result fs.Node, ferr fuse.Er
 		ferr = fuse.Error(err)
 		return
 	}
-	if n, found := self.childByName[filepath.Join(self.Path(), name)]; found {
+	childPath := self.Path().add(name)
+	if n, found := self.childByName[childPath.String()]; found {
 		result = n
 		return
 	}
@@ -221,30 +309,45 @@ func (self *dir) Lookup(name string, intr fs.Intr) (result fs.Node, ferr fuse.Er
 	return
 }
 
-func (self *futon) lookup(path string) (result fs.Node, ferr fuse.Error) {
+func (self *futon) lookup(path path) (result fs.Node, ferr fuse.Error) {
 	self.folderCacheLock.RLock()
-	d, found := self.folderCacheByPath[path]
+	d, found := self.folderCacheByPath[path.String()]
 	self.folderCacheLock.RUnlock()
 	if found {
 		result = d
 		return
 	}
-	if path == "/" {
-		result = self.newDir(path, self.rootFolderId, 0777)
+	if len(path) == 0 {
+		result = self.newNode(path, &drive.File{
+			Id: self.rootFolderId,
+			UserPermission: &drive.Permission{
+				Type: "owner",
+			},
+			MimeType: "application/vnd.google-apps.folder",
+		})
 		return
 	}
-	parent, err := self.lookup(filepath.Dir(path))
+	parent, err := self.lookup(path[:len(path)-1])
 	if err != nil {
 		return
 	}
 	if d, ok := parent.(*dir); ok {
-		return d.Lookup(filepath.Base(path), make(fs.Intr))
+		return d.Lookup(path[len(path)-1], make(fs.Intr))
 	}
 	ferr = fuse.Error(fmt.Errorf("No file %#v found"))
 	return
 }
 
+func (self *dir) clearChildren() {
+	self.childrenLock.Lock()
+	defer self.childrenLock.Unlock()
+	self.children = nil
+	self.childByName = map[string]node{}
+}
+
 func (self *dir) loadChildren() (err error) {
+	self.childrenLock.Lock()
+	defer self.childrenLock.Unlock()
 	if self.children == nil {
 		var childLoader func(string) error
 		foundChildren := 0
@@ -279,19 +382,15 @@ func (self *dir) loadChildren() (err error) {
 		}
 		for i := 0; i < foundChildren; i++ {
 			child := <-childChan
-
 			if child.err != nil {
 				return
 			}
-
-			var n node
-			if child.file.MimeType == "application/vnd.google-apps.folder" {
-				n = self.Futon().newDir(filepath.Join(self.Path(), child.file.Title), child.file.Id, 0777)
-			} else {
-				n = self.Futon().newFile(filepath.Join(self.Path(), child.file.Title), child.file.Id, 0777)
+			if !child.file.Labels.Trashed {
+				childPath := self.Path().add(child.file.Title)
+				n := self.Futon().newNode(childPath, child.file)
+				self.children = append(self.children, n)
+				self.childByName[n.Path().String()] = n
 			}
-			self.children = append(self.children, n)
-			self.childByName[n.Path()] = n
 		}
 	}
 	return
@@ -307,9 +406,11 @@ func (self *dir) ReadDir(intr fs.Intr) (result []fuse.Dirent, ferr fuse.Error) {
 		return
 	}
 	result = make([]fuse.Dirent, len(self.children))
+	self.childrenLock.RLock()
+	defer self.childrenLock.RUnlock()
 	for index, child := range self.children {
 		ent := fuse.Dirent{
-			Name: strings.Replace(filepath.Base(child.Path()), "/", "\u2215", -1),
+			Name: child.Path().base(),
 		}
 		switch child.(type) {
 		case *dir:
@@ -329,19 +430,8 @@ type file struct {
 	node
 }
 
-func (self *futon) newFile(path, id string, mode os.FileMode) *file {
-	return &file{
-		node: &nodeImpl{
-			futon: self,
-			path:  path,
-			id:    id,
-			mode:  mode,
-		},
-	}
-}
-
 func (self *futon) Root() (result fs.Node, err fuse.Error) {
-	return self.lookup("/")
+	return self.lookup(nil)
 }
 
 func (self *futon) unmount() {
