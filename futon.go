@@ -25,23 +25,6 @@ import (
 	"code.google.com/p/goauth2/oauth"
 )
 
-type futon struct {
-	auth              string
-	account           string
-	drive             *drive.Service
-	mountpoint        string
-	rootFolderId      string
-	lastChange        int64
-	folderCacheById   map[string]*dir
-	folderCacheByPath map[string]*dir
-	folderCacheLock   sync.RWMutex
-	unmounted         int32
-	conn              *fuse.Conn
-	client            *http.Client
-
-	Token *oauth.Token
-}
-
 // Settings for authorization.
 var config = &oauth.Config{
 	ClientId:     "944095575246-jq2jufr9k7s244jl9qb4nk1s36av4cd5.apps.googleusercontent.com",
@@ -50,6 +33,138 @@ var config = &oauth.Config{
 	RedirectURL:  "urn:ietf:wg:oauth:2.0:oob",
 	AuthURL:      "https://accounts.google.com/o/oauth2/auth",
 	TokenURL:     "https://accounts.google.com/o/oauth2/token",
+}
+
+var uid uint32
+var gid uint32
+
+func init() {
+	user, err := user.Current()
+	if err == nil {
+		uidint, _ := strconv.Atoi(user.Uid)
+		gidint, _ := strconv.Atoi(user.Gid)
+		uid = uint32(uidint)
+		gid = uint32(gidint)
+	}
+}
+
+// the common node functions
+type node interface {
+	fs.Node
+	Path() path
+	Futon() *futon
+	Id() string
+	Size() int64
+}
+
+// the basic stuff all nodes have
+type nodeImpl struct {
+	futon *futon
+	path  path
+	id    string
+	mode  os.FileMode
+	size  int64
+	atime time.Time
+	mtime time.Time
+}
+
+func (self *nodeImpl) Path() path {
+	return self.path
+}
+
+func (self *nodeImpl) Id() string {
+	return self.id
+}
+
+func (self *nodeImpl) Size() int64 {
+	return self.size
+}
+
+func (self *nodeImpl) Attr() fuse.Attr {
+	return fuse.Attr{
+		Mode:  self.mode,
+		Size:  uint64(self.size),
+		Uid:   uid,
+		Gid:   gid,
+		Atime: self.atime,
+		Mtime: self.mtime,
+		Ctime: self.mtime,
+	}
+}
+
+func (self *nodeImpl) Futon() *futon {
+	return self.futon
+}
+
+// since drive files can have / in them, i keep paths separated in a string slice
+type path []string
+
+// add returns a new path with the new element added at the end
+func (self path) add(el string) (result path) {
+	result = make(path, len(self)+1)
+	copy(result, self)
+	result[len(result)-1] = el
+	return
+}
+
+// the string rep of a path replaces the / with the divisor sign (U+2215) to be able to return it as a file system path
+func (self path) String() (result string) {
+	for index, el := range self {
+		result += strings.Replace(el, "/", "\u2215", -1)
+		if index < len(self)-1 {
+			result += "/"
+		}
+	}
+	return
+}
+
+// base will return the file name (the last path element)
+func (self path) base() string {
+	return strings.Replace(self[len(self)-1], "/", "\u2215", -1)
+}
+
+// dir will return the parent dir of path (all but the last element)
+func (self path) dir() (result string) {
+	for index, el := range self[:len(self)-1] {
+		result += strings.Replace(el, "/", "\u2215", -1)
+		if index < len(self)-2 {
+			result += "/"
+		}
+	}
+	return
+}
+
+// dir is a node that has children cached
+type dir struct {
+	node
+	children     []node          // used when listing children
+	childByPath  map[string]node // used when looking up children by path
+	childrenLock sync.RWMutex
+}
+
+// file is a node that has a download url
+type file struct {
+	node
+	downloadUrl string
+}
+
+// futon is saved in $HOME/.futon/auth, but its really just the Token that is saved
+type futon struct {
+	auth         string
+	account      string
+	drive        *drive.Service
+	mountpoint   string
+	rootFolderId string
+	lastChange   int64
+	unmounted    int32
+	conn         *fuse.Conn
+	client       *http.Client
+
+	folderCacheById   map[string]*dir // used when cleaning up folders that are subjected to change
+	folderCacheByPath map[string]*dir // used when finding folders by path
+	folderCacheLock   sync.RWMutex
+
+	Token *oauth.Token
 }
 
 func (self *futon) changeList() (result []*drive.Change, err error) {
@@ -164,110 +279,6 @@ func (self *futon) authorize() (err error) {
 	return
 }
 
-type nodeImpl struct {
-	futon *futon
-	path  path
-	id    string
-	mode  os.FileMode
-	size  int64
-	atime time.Time
-	mtime time.Time
-}
-
-func (self *nodeImpl) Path() path {
-	return self.path
-}
-
-type node interface {
-	fs.Node
-	Path() path
-	Futon() *futon
-	Id() string
-	Size() int64
-}
-
-func (self *nodeImpl) Id() string {
-	return self.id
-}
-
-func (self *nodeImpl) Size() int64 {
-	return self.size
-}
-
-var uid uint32
-var gid uint32
-
-func init() {
-	user, err := user.Current()
-	if err == nil {
-		uidint, _ := strconv.Atoi(user.Uid)
-		gidint, _ := strconv.Atoi(user.Gid)
-		uid = uint32(uidint)
-		gid = uint32(gidint)
-	}
-}
-
-type path []string
-
-func (self path) add(el string) (result path) {
-	result = make(path, len(self)+1)
-	copy(result, self)
-	result[len(result)-1] = el
-	return
-}
-
-func (self path) String() (result string) {
-	for index, el := range self {
-		result += strings.Replace(el, "/", "\u2215", -1)
-		if index < len(self)-1 {
-			result += "/"
-		}
-	}
-	return
-}
-
-func (self path) base() string {
-	return strings.Replace(self[len(self)-1], "/", "\u2215", -1)
-}
-
-func (self path) dir() (result string) {
-	for index, el := range self[:len(self)-1] {
-		result += strings.Replace(el, "/", "\u2215", -1)
-		if index < len(self)-2 {
-			result += "/"
-		}
-	}
-	return
-}
-
-func (self *nodeImpl) Attr() fuse.Attr {
-	return fuse.Attr{
-		Mode:  self.mode,
-		Size:  uint64(self.size),
-		Uid:   uid,
-		Gid:   gid,
-		Atime: self.atime,
-		Mtime: self.mtime,
-		Ctime: self.mtime,
-	}
-}
-
-func (self *nodeImpl) Futon() *futon {
-	return self.futon
-}
-
-type dir struct {
-	node
-	children     []node
-	childByName  map[string]node
-	childrenLock sync.RWMutex
-}
-
-type file struct {
-	node
-	downloadUrl string
-}
-
 func (self *file) getDownloadUrl() (result string, err error) {
 	if self.downloadUrl == "" {
 		var f *drive.File
@@ -347,7 +358,7 @@ func (self *futon) newNode(path path, f *drive.File) (result node) {
 		base.mode |= 0100
 		base.mode |= os.ModeDir
 		d := &dir{
-			childByName: map[string]node{},
+			childByPath: map[string]node{},
 			node:        base,
 		}
 		self.folderCacheLock.Lock()
@@ -374,7 +385,7 @@ func (self *dir) Lookup(name string, intr fs.Intr) (result fs.Node, ferr fuse.Er
 		return
 	}
 	childPath := self.Path().add(name)
-	if n, found := self.childByName[childPath.String()]; found {
+	if n, found := self.childByPath[childPath.String()]; found {
 		result = n
 		return
 	}
@@ -415,7 +426,7 @@ func (self *dir) clearChildren() {
 	self.childrenLock.Lock()
 	defer self.childrenLock.Unlock()
 	self.children = nil
-	self.childByName = map[string]node{}
+	self.childByPath = map[string]node{}
 }
 
 func (self *dir) loadChildren() (err error) {
@@ -462,7 +473,7 @@ func (self *dir) loadChildren() (err error) {
 				childPath := self.Path().add(child.file.Title)
 				n := self.Futon().newNode(childPath, child.file)
 				self.children = append(self.children, n)
-				self.childByName[n.Path().String()] = n
+				self.childByPath[n.Path().String()] = n
 			}
 		}
 	}
