@@ -265,37 +265,54 @@ type dir struct {
 
 type file struct {
 	node
+	downloadUrl string
 }
 
-func (self *file) Read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, intr fs.Intr) (ferr fuse.Error) {
+func (self *file) getDownloadUrl() (result string, err error) {
+	if self.downloadUrl == "" {
+		var f *drive.File
+		if f, err = self.Futon().drive.Files.Get(self.Id()).Do(); err != nil {
+			return
+		}
+		self.downloadUrl = f.DownloadUrl
+	}
+	result = self.downloadUrl
+	return
+}
+
+func (self *file) read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, tries int) (ferr fuse.Error) {
 	if self.Size() == 0 {
 		return
 	}
-	f, err := self.Futon().drive.Files.Get(self.Id()).Do()
+	downloadUrl, err := self.getDownloadUrl()
+	if err != nil {
+		return
+	}
+	if downloadUrl == "" {
+		return
+	}
+	req, err := http.NewRequest("GET", downloadUrl, nil)
 	if err != nil {
 		log.Printf("%v", err)
 		ferr = fuse.Error(err)
 		return
 	}
-	if f.DownloadUrl == "" {
-		return
-	}
-	req, err := http.NewRequest("GET", f.DownloadUrl, nil)
-	if err != nil {
-		log.Printf("%v", err)
-		ferr = fuse.Error(err)
-		return
-	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%v-%v", readReq.Offset, readReq.Offset+int64(readReq.Size)))
+	req.Header.Set("Range", fmt.Sprintf("bytes=%v-%v", readReq.Offset, readReq.Offset+int64(readReq.Size)-1))
 	resp, err := self.Futon().client.Do(req)
 	if err != nil {
 		log.Printf("%v", err)
 		ferr = fuse.Error(err)
 		return
 	}
+	if resp.StatusCode > 400 && resp.StatusCode < 404 {
+		self.downloadUrl = ""
+		if tries < 5 {
+			return self.read(readReq, readResp, tries+1)
+		}
+	}
 	if resp.StatusCode != 206 {
 		log.Printf("%+v", resp)
-		ferr = fuse.Error(fmt.Errorf("While trying to download %#v: %+v", f.DownloadUrl, resp))
+		ferr = fuse.Error(fmt.Errorf("While trying to download %#v: %+v", downloadUrl, resp))
 		return
 	}
 	defer resp.Body.Close()
@@ -304,8 +321,11 @@ func (self *file) Read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, i
 		ferr = fuse.Error(err)
 		return
 	}
-	log.Printf("got %+v\n%#v", resp, readResp.Data)
 	return
+}
+
+func (self *file) Read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, intr fs.Intr) (ferr fuse.Error) {
+	return self.read(readReq, readResp, 0)
 }
 
 func (self *futon) newNode(path path, f *drive.File) (result node) {
