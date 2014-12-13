@@ -351,9 +351,6 @@ func (self *futon) newNode(path path, f *drive.File) (result node) {
 		atime: atime,
 		mtime: mtime,
 	}
-	if f.UserPermission.Type == "owner" || f.UserPermission.Type == "writer" {
-		base.mode |= 0200
-	}
 	if f.MimeType == "application/vnd.google-apps.folder" {
 		base.mode |= 0100
 		base.mode |= os.ModeDir
