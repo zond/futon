@@ -22,10 +22,6 @@ import (
 	"google.golang.org/api/drive/v2"
 )
 
-const (
-	maxFileCache = 1 << 28
-)
-
 // Settings for authorization.
 var config = &oauth.Config{
 	ClientId:     "944095575246-jq2jufr9k7s244jl9qb4nk1s36av4cd5.apps.googleusercontent.com",
@@ -140,15 +136,15 @@ func (self path) dir() (result string) {
 	return
 }
 
-// dir is a node that has children cached
-type dir struct {
+// folder is a node that has children cached
+type folder struct {
 	node
 	children     []node          // used when listing children
 	childByPath  map[string]node // used when looking up children by path
 	childrenLock sync.RWMutex
 }
 
-func (self *dir) mergeChange(change *drive.Change) {
+func (self *folder) mergeChange(change *drive.Change) {
 	childPath := self.Path().add(change.File.Title)
 	if change.File.Labels.Trashed {
 		if _, found := self.childByPath[childPath.String()]; found {
@@ -180,7 +176,7 @@ func (self *dir) mergeChange(change *drive.Change) {
 	}
 }
 
-func (self *dir) Lookup(name string, intr fs.Intr) (result fs.Node, ferr fuse.Error) {
+func (self *folder) Lookup(name string, intr fs.Intr) (result fs.Node, ferr fuse.Error) {
 	if err := self.loadChildren(); err != nil {
 		ferr = fuse.Error(err)
 		return
@@ -194,14 +190,14 @@ func (self *dir) Lookup(name string, intr fs.Intr) (result fs.Node, ferr fuse.Er
 	return
 }
 
-func (self *dir) clearChildren() {
+func (self *folder) clearChildren() {
 	self.childrenLock.Lock()
 	defer self.childrenLock.Unlock()
 	self.children = nil
 	self.childByPath = map[string]node{}
 }
 
-func (self *dir) loadChildren() (err error) {
+func (self *folder) loadChildren() (err error) {
 	self.childrenLock.Lock()
 	defer self.childrenLock.Unlock()
 	if self.children == nil {
@@ -253,7 +249,7 @@ func (self *dir) loadChildren() (err error) {
 	return
 }
 
-func (self *dir) ReadDir(intr fs.Intr) (result []fuse.Dirent, ferr fuse.Error) {
+func (self *folder) ReadDir(intr fs.Intr) (result []fuse.Dirent, ferr fuse.Error) {
 	if err := self.Futon().cleanChanges(); err != nil {
 		ferr = fuse.Error(err)
 		return
@@ -270,7 +266,7 @@ func (self *dir) ReadDir(intr fs.Intr) (result []fuse.Dirent, ferr fuse.Error) {
 			Name: child.Path().base(),
 		}
 		switch child.(type) {
-		case *dir:
+		case *folder:
 			ent.Type = fuse.DT_Dir
 		case *file:
 			ent.Type = fuse.DT_File
@@ -351,7 +347,7 @@ func (self *file) Read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, i
 }
 
 type Futon struct {
-	configPath   string
+	dir          string
 	authorizer   func(string) string
 	drive        *drive.Service
 	mountpoint   string
@@ -362,8 +358,8 @@ type Futon struct {
 	client       *http.Client
 	logger       *log.Logger
 
-	folderCacheById   map[string]*dir // used when cleaning up folders that are subjected to change
-	folderCacheByPath map[string]*dir // used when finding folders by path
+	folderCacheById   map[string]*folder // used when cleaning up folders that are subjected to change
+	folderCacheByPath map[string]*folder // used when finding folders by path
 	folderCacheLock   sync.RWMutex
 
 	Token *oauth.Token
@@ -435,20 +431,21 @@ func (self *Futon) acquireToken() (err error) {
 }
 
 func (self *Futon) authorize() (err error) {
-	if err = os.MkdirAll(filepath.Dir(self.configPath), 0700); err != nil {
+	if err = os.MkdirAll(filepath.Dir(self.dir), 0700); err != nil {
 		return
 	}
-	f, err := os.Open(self.configPath)
+	configPath := filepath.Join(self.dir, "config")
+	f, err := os.Open(configPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			self.log("While trying to open %#v: %v", self.configPath, err)
+			self.log("While trying to open %#v: %v", configPath, err)
 			return
 		}
 		if err = self.acquireToken(); err != nil {
 			return
 		}
-		if f, err = os.Create(self.configPath); err != nil {
-			self.log("While trying to create %#v: %v", self.configPath, err)
+		if f, err = os.Create(configPath); err != nil {
+			self.log("While trying to create %#v: %v", configPath, err)
 			return
 		}
 		defer f.Close()
@@ -459,7 +456,7 @@ func (self *Futon) authorize() (err error) {
 	} else {
 		defer f.Close()
 		if err = json.NewDecoder(f).Decode(self); err != nil {
-			self.log("While trying to JSON decode %#v: %v", self.configPath, err)
+			self.log("While trying to JSON decode %#v: %v", configPath, err)
 			return
 		}
 	}
@@ -501,7 +498,7 @@ func (self *Futon) newNode(path path, f *drive.File) (result node) {
 	if f.MimeType == "application/vnd.google-apps.folder" {
 		base.mode |= 0100
 		base.mode |= os.ModeDir
-		d := &dir{
+		d := &folder{
 			childByPath: map[string]node{},
 			node:        base,
 		}
@@ -540,7 +537,7 @@ func (self *Futon) lookup(path path) (result fs.Node, ferr fuse.Error) {
 	if err != nil {
 		return
 	}
-	if d, ok := parent.(*dir); ok {
+	if d, ok := parent.(*folder); ok {
 		return d.Lookup(path[len(path)-1], make(fs.Intr))
 	}
 	ferr = fuse.Error(fmt.Errorf("No file %#v found"))
@@ -615,14 +612,14 @@ func (self *Futon) Mount() (err error) {
 }
 
 /*
-New will return a new Futon with the provided mountpoint, configPath
+New will return a new Futon with the provided mountpoint, dir and authorization callback
 */
-func New(mountpoint, configPath string, authorizer func(url string) (code string)) (result *Futon) {
+func New(mountpoint, dir string, authorizer func(url string) (code string)) (result *Futon) {
 	result = &Futon{
-		folderCacheById:   map[string]*dir{},
-		folderCacheByPath: map[string]*dir{},
+		folderCacheById:   map[string]*folder{},
+		folderCacheByPath: map[string]*folder{},
 		mountpoint:        mountpoint,
-		configPath:        configPath,
+		dir:               dir,
 		authorizer:        authorizer,
 	}
 	return
