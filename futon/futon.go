@@ -19,6 +19,7 @@ import (
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 	"code.google.com/p/goauth2/oauth"
+	"github.com/boltdb/bolt"
 	"google.golang.org/api/drive/v2"
 )
 
@@ -348,6 +349,7 @@ func (self *file) Read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, i
 
 type Futon struct {
 	dir          string
+	db           *bolt.DB
 	authorizer   func(string) string
 	drive        *drive.Service
 	mountpoint   string
@@ -430,35 +432,35 @@ func (self *Futon) acquireToken() (err error) {
 	return
 }
 
+var meta = []byte("meta")
+
 func (self *Futon) authorize() (err error) {
-	if err = os.MkdirAll(filepath.Dir(self.dir), 0700); err != nil {
+	if err = self.db.Update(func(tx *bolt.Tx) (err error) {
+		bucket, err := tx.CreateBucketIfNotExists(meta)
+		if err != nil {
+			return
+		}
+		metaData := bucket.Get(meta)
+		if metaData == nil {
+			if err = self.acquireToken(); err != nil {
+				return
+			}
+			if metaData, err = json.Marshal(self); err != nil {
+				self.log("While trying to JSON encode %+v: %v", self, err)
+				return
+			}
+			if err = bucket.Put(meta, metaData); err != nil {
+				return
+			}
+		} else {
+			if err = json.Unmarshal(metaData, self); err != nil {
+				self.log("While trying to JSON decode %s: %v", metaData, err)
+				return
+			}
+		}
 		return
-	}
-	configPath := filepath.Join(self.dir, "config")
-	f, err := os.Open(configPath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			self.log("While trying to open %#v: %v", configPath, err)
-			return
-		}
-		if err = self.acquireToken(); err != nil {
-			return
-		}
-		if f, err = os.Create(configPath); err != nil {
-			self.log("While trying to create %#v: %v", configPath, err)
-			return
-		}
-		defer f.Close()
-		if err = json.NewEncoder(f).Encode(self); err != nil {
-			self.log("While trying to JSON encode %+v: %v", self, err)
-			return
-		}
-	} else {
-		defer f.Close()
-		if err = json.NewDecoder(f).Decode(self); err != nil {
-			self.log("While trying to JSON decode %#v: %v", configPath, err)
-			return
-		}
+	}); err != nil {
+		return
 	}
 	transport := &oauth.Transport{
 		Config:    config,
@@ -572,6 +574,13 @@ func (self *Futon) unmount() {
 }
 
 func (self *Futon) Mount() (err error) {
+	if err = os.MkdirAll(self.dir, 0700); err != nil {
+		return
+	}
+	if self.db, err = bolt.Open(filepath.Join(self.dir, "futon.db"), 0600, nil); err != nil {
+		return
+	}
+
 	if err = self.authorize(); err != nil {
 		return
 	}
