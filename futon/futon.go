@@ -10,9 +10,9 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +22,10 @@ import (
 	"github.com/boltdb/bolt"
 	"google.golang.org/api/drive/v2"
 )
+
+var nodeByPath = []byte("nodeByPath")
+var nodePathById = []byte("nodePathById")
+var childPathsByPath = []byte("childPathsByPath")
 
 // Settings for authorization.
 var config = &oauth.Config{
@@ -51,58 +55,8 @@ type childFetch struct {
 	err  error
 }
 
-// the common node functions
-type node interface {
-	fs.Node
-	Path() path
-	Futon() *Futon
-	Id() string
-	Size() int64
-}
-
-// the basic stuff all nodes have
-type nodeImpl struct {
-	futon *Futon
-	path  path
-	id    string
-	mode  os.FileMode
-	size  int64
-	atime time.Time
-	mtime time.Time
-}
-
-func (self *nodeImpl) Path() path {
-	return self.path
-}
-
-func (self *nodeImpl) Id() string {
-	return self.id
-}
-
-func (self *nodeImpl) Size() int64 {
-	return self.size
-}
-
-func (self *nodeImpl) Attr() fuse.Attr {
-	return fuse.Attr{
-		Mode:  self.mode,
-		Size:  uint64(self.size),
-		Uid:   uid,
-		Gid:   gid,
-		Atime: self.atime,
-		Mtime: self.mtime,
-		Ctime: self.mtime,
-	}
-}
-
-func (self *nodeImpl) Futon() *Futon {
-	return self.futon
-}
-
-// since drive files can have / in them, i keep paths separated in a string slice
 type path []string
 
-// add returns a new path with the new element added at the end
 func (self path) add(el string) (result path) {
 	result = make(path, len(self)+1)
 	copy(result, self)
@@ -110,8 +64,8 @@ func (self path) add(el string) (result path) {
 	return
 }
 
-// the string rep of a path replaces the / with the divisor sign (U+2215) to be able to return it as a file system path
 func (self path) String() (result string) {
+	result = "/"
 	for index, el := range self {
 		result += strings.Replace(el, "/", "\u2215", -1)
 		if index < len(self)-1 {
@@ -121,108 +75,122 @@ func (self path) String() (result string) {
 	return
 }
 
-// base will return the file name (the last path element)
-func (self path) base() string {
+func (self path) name() string {
+	if len(self) == 0 {
+		return ""
+	}
 	return strings.Replace(self[len(self)-1], "/", "\u2215", -1)
 }
 
-// dir will return the parent dir of path (all but the last element)
-func (self path) dir() (result string) {
-	for index, el := range self[:len(self)-1] {
-		result += strings.Replace(el, "/", "\u2215", -1)
-		if index < len(self)-2 {
-			result += "/"
-		}
+func (self path) parent() path {
+	return self[:len(self)-1]
+}
+
+func (self path) marshal() []byte {
+	return []byte(self.String())
+}
+
+func (self *path) unmarshal(b []byte) {
+	*self = nil
+	for _, el := range strings.Split(string(b), "/")[1:] {
+		*self = append(*self, strings.Replace(el, "\u2215", "/", -1))
 	}
-	return
 }
 
-// folder is a node that has children cached
-type folder struct {
-	node
-	children     []node          // used when listing children
-	childByPath  map[string]node // used when looking up children by path
-	childrenLock sync.RWMutex
+type node struct {
+	futon       *Futon
+	downloadUrl string
+
+	LoadedChildren bool
+	Path           path
+	Id             string
+	Mode           os.FileMode
+	Size           int64
+	Atime          time.Time
+	Mtime          time.Time
 }
 
-func (self *folder) mergeChange(change *drive.Change) {
-	childPath := self.Path().add(change.File.Title)
-	if change.File.Labels.Trashed {
-		if _, found := self.childByPath[childPath.String()]; found {
-			for index, child := range self.children {
-				if child.Id() == change.File.Id {
-					self.childrenLock.Lock()
-					newChildren := make([]node, len(self.children)-1)
-					if index == 0 {
-						copy(newChildren, self.children[1:])
-					} else if index == len(self.children)-1 {
-						copy(newChildren, self.children)
-					} else {
-						copy(newChildren, self.children[:index])
-						copy(newChildren[index:], self.children[index+1:])
-					}
-					self.children = newChildren
-					delete(self.childByPath, childPath.String())
-					self.childrenLock.Unlock()
-					break
-				}
+func (self *node) Attr() fuse.Attr {
+	return fuse.Attr{
+		Mode:  self.Mode,
+		Size:  uint64(self.Size),
+		Uid:   uid,
+		Gid:   gid,
+		Atime: self.Atime,
+		Mtime: self.Mtime,
+		Ctime: self.Mtime,
+	}
+}
+
+func stack() string {
+	buf := make([]byte, 4096)
+	runtime.Stack(buf, false)
+	return strings.Join(strings.Split(string(buf), "\n")[3:14], "\n")
+}
+
+func (self *node) save() (err error) {
+	if err = self.futon.db.Update(func(tx *bolt.Tx) (err error) {
+		bucket, err := tx.CreateBucketIfNotExists(nodeByPath)
+		if err != nil {
+			self.futon.log("While trying to create nodeByPath bucket: %v", err)
+			return
+		}
+		data, err := json.Marshal(self)
+		if err != nil {
+			self.futon.log("While trying to JSON encode %+v: %v", self, err)
+			return
+		}
+		if err = bucket.Put(self.Path.marshal(), data); err != nil {
+			self.futon.log("While trying to save %+v: %v", self, err)
+			return
+		}
+		if bucket, err = tx.CreateBucketIfNotExists(nodePathById); err != nil {
+			self.futon.log("While trying to create nodePathById bucket: %v", err)
+			return
+		}
+		if err = bucket.Put([]byte(self.Id), self.Path.marshal()); err != nil {
+			self.futon.log("While trying to save %#v: %v", self.Path, err)
+			return
+		}
+		if len(self.Path) > 0 {
+			if bucket, err = tx.CreateBucketIfNotExists(childPathsByPath); err != nil {
+				self.futon.log("While trying to create childPathsByPath bucket: %v", err)
+				return
+			}
+			if bucket, err = bucket.CreateBucketIfNotExists(self.Path.parent().marshal()); err != nil {
+				self.futon.log("While trying to create child bucket for %+v: %v", self, err)
+				return
+			}
+			if err = bucket.Put(self.Path.marshal(), self.Path.marshal()); err != nil {
+				self.futon.log("While trying to save %#v: %v", self.Path, err)
+				return
 			}
 		}
-	} else {
-		newChild := self.Futon().newNode(childPath, change.File)
-		self.childrenLock.Lock()
-		self.children = append(self.children, newChild)
-		self.childByPath[childPath.String()] = newChild
-		self.childrenLock.Unlock()
-	}
-}
-
-func (self *folder) Lookup(name string, intr fs.Intr) (result fs.Node, ferr fuse.Error) {
-	if err := self.loadChildren(); err != nil {
-		ferr = fuse.Error(err)
+		return
+	}); err != nil {
 		return
 	}
-	childPath := self.Path().add(name)
-	if n, found := self.childByPath[childPath.String()]; found {
-		result = n
-		return
-	}
-	ferr = fuse.Error(fmt.Errorf("No file %#v inside %#v", name, self.Path()))
 	return
 }
 
-func (self *folder) clearChildren() {
-	self.childrenLock.Lock()
-	defer self.childrenLock.Unlock()
-	self.children = nil
-	self.childByPath = map[string]node{}
-}
-
-func (self *folder) loadChildren() (err error) {
-	self.childrenLock.Lock()
-	defer self.childrenLock.Unlock()
-	if self.children == nil {
+func (self *node) createChildren() (err error) {
+	if !self.LoadedChildren {
+		self.LoadedChildren = true
 		var childLoader func(string) error
-		foundChildren := 0
-		childChan := make(chan childFetch)
 		childLoader = func(pageToken string) (err error) {
-			call := self.Futon().drive.Children.List(self.Id()).MaxResults(8192)
+			call := self.futon.drive.Files.List().Q(fmt.Sprintf("'%s' in parents and trashed = false", self.Id)).MaxResults(8192)
 			if pageToken != "" {
 				call = call.PageToken(pageToken)
 			}
-			var children *drive.ChildList
+			var children *drive.FileList
 			if children, err = call.Do(); err != nil {
-				self.Futon().log("While trying to load children for %#v: %v", self.Path().String(), err)
+				self.futon.log("While trying to load children for %#v: %v", self.Path.String(), err)
 				return
 			}
 			for _, child := range children.Items {
-				childCopy := child
-				foundChildren++
-				go func() {
-					fetch := childFetch{}
-					fetch.file, fetch.err = self.Futon().drive.Files.Get(childCopy.Id).Do()
-					childChan <- fetch
-				}()
+				if err = self.futon.newNode(self.Path.add(child.Title), child).save(); err != nil {
+					return
+				}
 			}
 			if children.NextPageToken != "" {
 				if err = childLoader(children.NextPageToken); err != nil {
@@ -234,63 +202,70 @@ func (self *folder) loadChildren() (err error) {
 		if err = childLoader(""); err != nil {
 			return
 		}
-		for i := 0; i < foundChildren; i++ {
-			child := <-childChan
-			if child.err != nil {
-				return
-			}
-			if !child.file.Labels.Trashed {
-				childPath := self.Path().add(child.file.Title)
-				n := self.Futon().newNode(childPath, child.file)
-				self.children = append(self.children, n)
-				self.childByPath[n.Path().String()] = n
-			}
+		if err = self.save(); err != nil {
+			return
 		}
 	}
 	return
 }
 
-func (self *folder) ReadDir(intr fs.Intr) (result []fuse.Dirent, ferr fuse.Error) {
-	if err := self.Futon().cleanChanges(); err != nil {
-		ferr = fuse.Error(err)
-		return
-	}
-	if err := self.loadChildren(); err != nil {
-		ferr = fuse.Error(err)
-		return
-	}
-	result = make([]fuse.Dirent, len(self.children))
-	self.childrenLock.RLock()
-	defer self.childrenLock.RUnlock()
-	for index, child := range self.children {
-		ent := fuse.Dirent{
-			Name: child.Path().base(),
+func (self *node) Lookup(name string, intr fs.Intr) (result fs.Node, ferr fuse.Error) {
+	if err := self.futon.db.View(func(tx *bolt.Tx) (err error) {
+		if bucket := tx.Bucket(nodeByPath); bucket != nil {
+			if data := bucket.Get(self.Path.add(name).marshal()); data != nil {
+				n := &node{
+					futon: self.futon,
+				}
+				if err = json.Unmarshal(data, n); err != nil {
+					self.futon.log("While trying to JSON decode %s: %v", data, err)
+					return
+				}
+				result = n
+			}
 		}
-		switch child.(type) {
-		case *folder:
-			ent.Type = fuse.DT_Dir
-		case *file:
+		return
+	}); err != nil {
+		ferr = fuse.Error(err)
+		return
+	}
+	if result == nil {
+		ferr = fuse.Error(fmt.Errorf("%#v not found in %#v", name, self.Path.String()))
+		return
+	}
+	return
+}
+
+func (self *node) ReadDir(intr fs.Intr) (result []fuse.Dirent, ferr fuse.Error) {
+	if err := self.createChildren(); err != nil {
+		ferr = fuse.Error(err)
+		return
+	}
+	children, err := self.futon.children(self.Path)
+	if err != nil {
+		ferr = fuse.Error(err)
+		return
+	}
+	result = make([]fuse.Dirent, len(children))
+	for index, child := range children {
+		ent := fuse.Dirent{
+			Name: child.Path.name(),
+		}
+		if child.Mode&os.ModeDir == 0 {
 			ent.Type = fuse.DT_File
-		default:
-			ferr = fuse.Error(fmt.Errorf("Unknown node implementation: %#v", child))
-			return
+		} else {
+			ent.Type = fuse.DT_Dir
+			go child.createChildren()
 		}
 		result[index] = ent
 	}
 	return
 }
 
-// file is a node that has a download url
-type file struct {
-	node
-	downloadUrl string
-}
-
-func (self *file) getDownloadUrl() (result string, err error) {
+func (self *node) getDownloadUrl() (result string, err error) {
 	if self.downloadUrl == "" {
 		var f *drive.File
-		if f, err = self.Futon().drive.Files.Get(self.Id()).Do(); err != nil {
-			self.Futon().log("While trying to get %#v: %v", self.Path().String(), err)
+		if f, err = self.futon.drive.Files.Get(self.Id).Do(); err != nil {
+			self.futon.log("While trying to get %#v: %v", self.Path.String(), err)
 			return
 		}
 		self.downloadUrl = f.DownloadUrl
@@ -299,8 +274,8 @@ func (self *file) getDownloadUrl() (result string, err error) {
 	return
 }
 
-func (self *file) read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, tries int) (ferr fuse.Error) {
-	if self.Size() == 0 {
+func (self *node) read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, tries int) (ferr fuse.Error) {
+	if self.Size == 0 {
 		return
 	}
 	downloadUrl, err := self.getDownloadUrl()
@@ -312,14 +287,14 @@ func (self *file) read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, t
 	}
 	req, err := http.NewRequest("GET", downloadUrl, nil)
 	if err != nil {
-		self.Futon().log("While trying to create GET request for %#v: %v", downloadUrl, err)
+		self.futon.log("While trying to create GET request for %#v: %v", downloadUrl, err)
 		ferr = fuse.Error(err)
 		return
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%v-%v", readReq.Offset, readReq.Offset+int64(readReq.Size)-1))
-	resp, err := self.Futon().client.Do(req)
+	resp, err := self.futon.client.Do(req)
 	if err != nil {
-		self.Futon().log("While trying to perform %+v: %v", req, err)
+		self.futon.log("While trying to perform %+v: %v", req, err)
 		ferr = fuse.Error(err)
 		return
 	}
@@ -336,14 +311,14 @@ func (self *file) read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, t
 	}
 	defer resp.Body.Close()
 	if readResp.Data, err = ioutil.ReadAll(resp.Body); err != nil {
-		self.Futon().log("While trying to read the body of %+v: %v", resp, err)
+		self.futon.log("While trying to read the body of %+v: %v", resp, err)
 		ferr = fuse.Error(err)
 		return
 	}
 	return
 }
 
-func (self *file) Read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, intr fs.Intr) (ferr fuse.Error) {
+func (self *node) Read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, intr fs.Intr) (ferr fuse.Error) {
 	return self.read(readReq, readResp, 0)
 }
 
@@ -357,10 +332,6 @@ type Futon struct {
 	conn       *fuse.Conn
 	client     *http.Client
 	logger     *log.Logger
-
-	folderCacheById   map[string]*folder // used when cleaning up folders that are subjected to change
-	folderCacheByPath map[string]*folder // used when finding folders by path
-	folderCacheLock   sync.RWMutex
 
 	RootFolderId string
 	LastChange   int64
@@ -376,9 +347,11 @@ func (self *Futon) saveMetadata() (err error) {
 		}
 		bucket, err := tx.CreateBucketIfNotExists(meta)
 		if err != nil {
+			self.log("While trying to create meta bucket: %v", err)
 			return
 		}
 		if err = bucket.Put(meta, metaData); err != nil {
+			self.log("While trying to save %+v: %v", self, err)
 			return
 		}
 		return
@@ -427,19 +400,57 @@ func (self *Futon) changeList() (result []*drive.Change, err error) {
 	return
 }
 
-func (self *Futon) cleanChanges() (err error) {
+func (self *Futon) mergeChanges() (err error) {
 	changes, err := self.changeList()
 	if err != nil {
 		return
 	}
-	self.folderCacheLock.Lock()
-	defer self.folderCacheLock.Unlock()
-	for _, change := range changes {
-		for _, parent := range change.File.Parents {
-			if d, found := self.folderCacheById[parent.Id]; found {
-				d.mergeChange(change)
+	if err = self.db.Update(func(tx *bolt.Tx) (err error) {
+		nodePathById, err := tx.CreateBucketIfNotExists(nodePathById)
+		if err != nil {
+			self.log("While trying to create nodePathById bucket: %v", err)
+			return
+		}
+		nodeByPath, err := tx.CreateBucketIfNotExists(nodeByPath)
+		if err != nil {
+			self.log("While trying to create nodeByPath bucket: %v", err)
+			return
+		}
+		childPathsByPath, err := tx.CreateBucketIfNotExists(childPathsByPath)
+		if err != nil {
+			self.log("While trying to create childPathsByPath bucket: %v", err)
+			return
+		}
+		for _, change := range changes {
+			pathData := nodePathById.Get([]byte(change.File.Id))
+			if pathData != nil {
+				p := path{}
+				(&p).unmarshal(pathData)
+				if change.File.Labels.Trashed {
+					if err = nodePathById.Delete([]byte(change.File.Id)); err != nil {
+						self.log("While trying to delete %#v: %v", change.File.Id, err)
+						return
+					}
+					if err = nodeByPath.Delete(pathData); err != nil {
+						self.log("While trying to delete %s: %v", pathData, err)
+						return
+					}
+					if childPaths := childPathsByPath.Bucket(p.parent().marshal()); childPaths != nil {
+						if err = childPaths.Delete(p.marshal()); err != nil {
+							self.log("While trying to delete %s: %v", p.marshal(), err)
+							return
+						}
+					}
+				} else {
+					if err = self.newNode(p, change.File).save(); err != nil {
+						return
+					}
+				}
 			}
 		}
+		return
+	}); err != nil {
+		return
 	}
 	return
 }
@@ -464,6 +475,7 @@ func (self *Futon) authorize() (err error) {
 	if err = self.db.Update(func(tx *bolt.Tx) (err error) {
 		bucket, err := tx.CreateBucketIfNotExists(meta)
 		if err != nil {
+			self.log("While trying to create meta bucket: %v", err)
 			return
 		}
 		metaData := bucket.Get(meta)
@@ -476,6 +488,7 @@ func (self *Futon) authorize() (err error) {
 				return
 			}
 			if err = bucket.Put(meta, metaData); err != nil {
+				self.log("While trying to create save %+v: %v", self, err)
 				return
 			}
 		} else {
@@ -495,6 +508,7 @@ func (self *Futon) authorize() (err error) {
 	}
 	self.client = transport.Client()
 	if self.drive, err = drive.New(self.client); err != nil {
+		self.log("While trying to connect to Drive: %v", err)
 		return
 	}
 
@@ -513,69 +527,95 @@ func (self *Futon) authorize() (err error) {
 	return
 }
 
-func (self *Futon) newNode(path path, f *drive.File) (result node) {
+func (self *Futon) newNode(path path, f *drive.File) (result *node) {
 	atime, _ := time.Parse(time.RFC3339, f.LastViewedByMeDate)
 	mtime, _ := time.Parse(time.RFC3339, f.ModifiedDate)
-	base := &nodeImpl{
+	result = &node{
 		futon: self,
-		path:  path,
-		id:    f.Id,
-		mode:  os.FileMode(0400),
-		size:  f.FileSize,
-		atime: atime,
-		mtime: mtime,
+		Path:  path,
+		Id:    f.Id,
+		Mode:  os.FileMode(0400),
+		Size:  f.FileSize,
+		Atime: atime,
+		Mtime: mtime,
 	}
 	if f.MimeType == "application/vnd.google-apps.folder" {
-		base.mode |= 0100
-		base.mode |= os.ModeDir
-		d := &folder{
-			childByPath: map[string]node{},
-			node:        base,
-		}
-		self.folderCacheLock.Lock()
-		defer self.folderCacheLock.Unlock()
-		self.folderCacheByPath[base.Path().String()] = d
-		self.folderCacheById[base.Id()] = d
-		result = d
-	} else {
-		result = &file{
-			node: base,
-		}
+		result.Mode |= 0100 | os.ModeDir
 	}
 	return
 }
 
-func (self *Futon) lookup(path path) (result fs.Node, ferr fuse.Error) {
-	self.folderCacheLock.RLock()
-	d, found := self.folderCacheByPath[path.String()]
-	self.folderCacheLock.RUnlock()
-	if found {
-		result = d
+func (self *Futon) children(p path) (result []*node, err error) {
+	if err = self.db.View(func(tx *bolt.Tx) (err error) {
+		childPaths := []path{}
+		if bucket := tx.Bucket(childPathsByPath); bucket != nil {
+			if children := bucket.Bucket(p.marshal()); children != nil {
+				cursor := children.Cursor()
+				for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+					childPath := &path{}
+					childPath.unmarshal(value)
+					childPaths = append(childPaths, *childPath)
+				}
+			}
+		}
+		if bucket := tx.Bucket(nodeByPath); bucket != nil {
+			for _, childPath := range childPaths {
+				if data := bucket.Get(childPath.marshal()); data != nil {
+					n := &node{
+						futon: self,
+					}
+					if err = json.Unmarshal(data, n); err != nil {
+						self.log("While trying to JSON decode %s: %v", data, err)
+						return
+					}
+					result = append(result, n)
+				}
+			}
+		}
+		return
+	}); err != nil {
 		return
 	}
-	if len(path) == 0 {
-		result = self.newNode(path, &drive.File{
-			Id: self.RootFolderId,
-			UserPermission: &drive.Permission{
-				Type: "owner",
-			},
-			MimeType: "application/vnd.google-apps.folder",
-		})
+	return
+}
+
+func (self *Futon) root() (result *node, err error) {
+	if err = self.db.View(func(tx *bolt.Tx) (err error) {
+		if bucket := tx.Bucket(nodeByPath); bucket != nil {
+			var rootPath path
+			if data := bucket.Get(rootPath.marshal()); data != nil {
+				result = &node{
+					futon: self,
+				}
+				if err = json.Unmarshal(data, result); err != nil {
+					self.log("While trying to JSON decode %s: %v", data, err)
+					return
+				}
+				return
+			}
+		}
+		return
+	}); err != nil || result != nil {
 		return
 	}
-	parent, err := self.lookup(path[:len(path)-1])
+	result = &node{
+		futon: self,
+		Id:    self.RootFolderId,
+		Mode:  0500 | os.ModeDir,
+	}
+	if err = result.save(); err != nil {
+		return
+	}
+	return
+}
+
+func (self *Futon) Root() (result fs.Node, ferr fuse.Error) {
+	result, err := self.root()
 	if err != nil {
+		ferr = fuse.Error(err)
 		return
 	}
-	if d, ok := parent.(*folder); ok {
-		return d.Lookup(path[len(path)-1], make(fs.Intr))
-	}
-	ferr = fuse.Error(fmt.Errorf("No file %#v found"))
 	return
-}
-
-func (self *Futon) Root() (result fs.Node, err fuse.Error) {
-	return self.lookup(nil)
 }
 
 func (self *Futon) log(format string, params ...interface{}) {
@@ -648,16 +688,11 @@ func (self *Futon) Mount() (err error) {
 	return
 }
 
-/*
-New will return a new Futon with the provided mountpoint, dir and authorization callback
-*/
 func New(mountpoint, dir string, authorizer func(url string) (code string)) (result *Futon) {
 	result = &Futon{
-		folderCacheById:   map[string]*folder{},
-		folderCacheByPath: map[string]*folder{},
-		mountpoint:        mountpoint,
-		dir:               dir,
-		authorizer:        authorizer,
+		mountpoint: mountpoint,
+		dir:        dir,
+		authorizer: authorizer,
 	}
 	return
 }
