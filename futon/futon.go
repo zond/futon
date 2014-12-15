@@ -348,30 +348,51 @@ func (self *file) Read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, i
 }
 
 type Futon struct {
-	dir          string
-	db           *bolt.DB
-	authorizer   func(string) string
-	drive        *drive.Service
-	mountpoint   string
-	rootFolderId string
-	lastChange   int64
-	unmounted    int32
-	conn         *fuse.Conn
-	client       *http.Client
-	logger       *log.Logger
+	dir        string
+	db         *bolt.DB
+	authorizer func(string) string
+	drive      *drive.Service
+	mountpoint string
+	unmounted  int32
+	conn       *fuse.Conn
+	client     *http.Client
+	logger     *log.Logger
 
 	folderCacheById   map[string]*folder // used when cleaning up folders that are subjected to change
 	folderCacheByPath map[string]*folder // used when finding folders by path
 	folderCacheLock   sync.RWMutex
 
-	Token *oauth.Token
+	RootFolderId string
+	LastChange   int64
+	Token        *oauth.Token
+}
+
+func (self *Futon) saveMetadata() (err error) {
+	if err = self.db.Update(func(tx *bolt.Tx) (err error) {
+		metaData, err := json.Marshal(self)
+		if err != nil {
+			self.log("While trying to JSON encode %+v: %v", self, err)
+			return
+		}
+		bucket, err := tx.CreateBucketIfNotExists(meta)
+		if err != nil {
+			return
+		}
+		if err = bucket.Put(meta, metaData); err != nil {
+			return
+		}
+		return
+	}); err != nil {
+		return
+	}
+	return
 }
 
 func (self *Futon) changeList() (result []*drive.Change, err error) {
 	var changeLoader func(string) error
 	newLastChange := int64(0)
 	changeLoader = func(pageToken string) (err error) {
-		call := self.drive.Changes.List().StartChangeId(self.lastChange).IncludeDeleted(true)
+		call := self.drive.Changes.List().StartChangeId(self.LastChange).IncludeDeleted(true)
 		if pageToken != "" {
 			call = call.PageToken(pageToken)
 		}
@@ -383,7 +404,7 @@ func (self *Futon) changeList() (result []*drive.Change, err error) {
 		for _, change := range changes.Items {
 			changeCopy := change
 			newLastChange = changeCopy.Id
-			if changeCopy.Id != self.lastChange {
+			if changeCopy.Id != self.LastChange {
 				result = append(result, changeCopy)
 			}
 		}
@@ -397,7 +418,12 @@ func (self *Futon) changeList() (result []*drive.Change, err error) {
 	if err = changeLoader(""); err != nil {
 		return
 	}
-	self.lastChange = newLastChange
+	if newLastChange != self.LastChange {
+		self.LastChange = newLastChange
+		if err = self.saveMetadata(); err != nil {
+			return
+		}
+	}
 	return
 }
 
@@ -472,13 +498,15 @@ func (self *Futon) authorize() (err error) {
 		return
 	}
 
-	about, err := self.drive.About.Get().Do()
-	if err != nil {
-		self.log("While trying to get About: %v", err)
-		return
+	if self.RootFolderId == "" || self.LastChange == 0 {
+		var about *drive.About
+		if about, err = self.drive.About.Get().Do(); err != nil {
+			self.log("While trying to get About: %v", err)
+			return
+		}
+		self.RootFolderId = about.RootFolderId
+		self.LastChange = about.LargestChangeId
 	}
-	self.rootFolderId = about.RootFolderId
-	self.lastChange = about.LargestChangeId
 
 	self.log("Connected to Google Drive")
 
@@ -527,7 +555,7 @@ func (self *Futon) lookup(path path) (result fs.Node, ferr fuse.Error) {
 	}
 	if len(path) == 0 {
 		result = self.newNode(path, &drive.File{
-			Id: self.rootFolderId,
+			Id: self.RootFolderId,
 			UserPermission: &drive.Permission{
 				Type: "owner",
 			},
