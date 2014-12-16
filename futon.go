@@ -12,6 +12,7 @@ import (
 
 func main() {
 	config := flag.String("dir", filepath.Join(os.Getenv("HOME"), ".futon"), "Which directory should contain the config and cache")
+	loglevel := flag.Int("loglevel", 4, "How much to log. Higher is more.")
 
 	flag.Parse()
 
@@ -26,7 +27,7 @@ func main() {
 		fmt.Printf("Go to %#v\nEnter the code: ", url)
 		fmt.Scanln(&result)
 		return
-	}).Logger(log.New(os.Stderr, "", 0))
+	}).Logger(log.New(os.Stderr, "", 0)).Loglevel(*loglevel)
 
 	if err := f.Mount(); err != nil {
 		panic(err)
