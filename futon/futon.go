@@ -27,13 +27,13 @@ import (
 )
 
 const (
-	blockSize = 1 << 19
+	blockSize = 1 << 20
 )
 
 var nodeByPath = []byte("nodeByPath")
 var nodePathById = []byte("nodePathById")
 var childPathsByPath = []byte("childPathsByPath")
-var blocksByPath = []byte("blocksByPath")
+var blocksById = []byte("blocksById")
 var cacheUsageByTime = []byte("cacheUsageByTime")
 
 // Settings for authorization.
@@ -60,8 +60,6 @@ func init() {
 }
 
 type childFetch struct {
-	file *drive.File
-	err  error
 }
 
 type path []string
@@ -113,13 +111,14 @@ type node struct {
 	futon       *Futon
 	downloadUrl string
 
-	LoadedChildren bool
-	Path           path
-	Id             string
-	Mode           os.FileMode
-	Size           int64
-	Atime          time.Time
-	Mtime          time.Time
+	LatestCacheUsage time.Time
+	LoadedChildren   bool
+	Path             path
+	Id               string
+	Mode             os.FileMode
+	Size             int64
+	Atime            time.Time
+	Mtime            time.Time
 }
 
 func (self *node) Attr() fuse.Attr {
@@ -140,53 +139,6 @@ func stack() string {
 	return strings.Join(strings.Split(string(buf), "\n")[3:14], "\n")
 }
 
-func (self *node) rawSave(tx *bolt.Tx) (err error) {
-	bucket, err := tx.CreateBucketIfNotExists(nodeByPath)
-	if err != nil {
-		self.futon.fatal("While trying to create nodeByPath bucket: %v", err)
-		return
-	}
-	data, err := json.Marshal(self)
-	if err != nil {
-		self.futon.fatal("While trying to JSON encode %+v: %v", self, err)
-		return
-	}
-	if err = bucket.Put(self.Path.marshal(), data); err != nil {
-		self.futon.fatal("While trying to save %+v: %v", self, err)
-		return
-	}
-	if bucket, err = tx.CreateBucketIfNotExists(nodePathById); err != nil {
-		self.futon.fatal("While trying to create nodePathById bucket: %v", err)
-		return
-	}
-	if err = bucket.Put([]byte(self.Id), self.Path.marshal()); err != nil {
-		self.futon.fatal("While trying to save %#v: %v", self.Path, err)
-		return
-	}
-	if len(self.Path) > 0 {
-		if bucket, err = tx.CreateBucketIfNotExists(childPathsByPath); err != nil {
-			self.futon.fatal("While trying to create childPathsByPath bucket: %v", err)
-			return
-		}
-		if bucket, err = bucket.CreateBucketIfNotExists(self.Path.parent().marshal()); err != nil {
-			self.futon.fatal("While trying to create child bucket for %+v: %v", self, err)
-			return
-		}
-		if err = bucket.Put(self.Path.marshal(), []byte{0}); err != nil {
-			self.futon.fatal("While trying to save %#v: %v", self.Path, err)
-			return
-		}
-	}
-	return
-}
-
-func (self *node) save() (err error) {
-	if err = self.futon.db.Update(self.rawSave); err != nil {
-		return
-	}
-	return
-}
-
 func (self *node) createChildren() (err error) {
 	if !self.LoadedChildren {
 		self.LoadedChildren = true
@@ -203,10 +155,15 @@ func (self *node) createChildren() (err error) {
 				return
 			}
 			self.futon.debug("Done listing children of %v", self.Path)
-			for _, child := range children.Items {
-				if err = self.futon.newNode(self.Path.add(child.Title), child).save(); err != nil {
-					return
+			if err = self.futon.withBuckets(func(b buckets) (err error) {
+				for _, child := range children.Items {
+					if err = b.saveNode(self.futon.newNode(self.Path.add(child.Title), child)); err != nil {
+						return
+					}
 				}
+				return
+			}); err != nil {
+				return
 			}
 			if children.NextPageToken != "" {
 				if err = childLoader(children.NextPageToken); err != nil {
@@ -218,7 +175,9 @@ func (self *node) createChildren() (err error) {
 		if err = childLoader(""); err != nil {
 			return
 		}
-		if err = self.save(); err != nil {
+		if err = self.futon.withBuckets(func(b buckets) (err error) {
+			return b.saveNode(self)
+		}); err != nil {
 			return
 		}
 	}
@@ -311,7 +270,6 @@ func (self *node) read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse) (
 	firstBlock := readReq.Offset / blockSize
 	lastBlock := (readReq.Offset + int64(readReq.Size)) / blockSize
 	blockOffset := readReq.Offset % blockSize
-	self.futon.debug("Loading %v bytes from %v of %v entails loading blocks from %v to %v", readReq.Size, readReq.Offset, self.Path, firstBlock, lastBlock)
 	var block []byte
 	copied := 0
 	for i := firstBlock; i <= lastBlock; i++ {
@@ -334,16 +292,40 @@ func (self *node) read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse) (
 	return
 }
 
+func (self *node) cacheUsageKey() (result []byte) {
+	result = make([]byte, 8)
+	binary.BigEndian.PutUint64(result, uint64(self.LatestCacheUsage.UnixNano()))
+	result = append(result, []byte(self.Id)...)
+	return
+}
+
 func (self *node) blockKey(n int64) (result []byte) {
 	result = make([]byte, binary.MaxVarintLen64)
 	result = result[:binary.PutVarint(result, n)]
 	return
 }
 
+func (self *node) saveUsage(tx *bolt.Tx) (err error) {
+	bucket, err := tx.CreateBucketIfNotExists(cacheUsageByTime)
+	if err != nil {
+		self.futon.fatal("While trying to create cacheUsageByTime bucket: %v", err)
+		return
+	}
+	if err = bucket.Delete(self.cacheUsageKey()); err != nil {
+		return
+	}
+	self.LatestCacheUsage = time.Now()
+	if err = bucket.Put(self.cacheUsageKey(), []byte(self.Id)); err != nil {
+		self.futon.fatal("While trying to save cache usage timestamp for %s: %v", self.Path, err)
+		return
+	}
+	return
+}
+
 func (self *node) loadBlock(n int64, tries int) (result []byte, err error) {
 	if err = self.futon.db.View(func(tx *bolt.Tx) (err error) {
-		if blocksByPath := tx.Bucket(blocksByPath); blocksByPath != nil {
-			if myBlocks := blocksByPath.Bucket([]byte(self.Id)); myBlocks != nil {
+		if blocksById := tx.Bucket(blocksById); blocksById != nil {
+			if myBlocks := blocksById.Bucket([]byte(self.Id)); myBlocks != nil {
 				block := myBlocks.Get(self.blockKey(n))
 				if block != nil {
 					result = make([]byte, len(block))
@@ -354,22 +336,9 @@ func (self *node) loadBlock(n int64, tries int) (result []byte, err error) {
 		return
 	}); err != nil || result != nil {
 		if result != nil {
-			if err = self.futon.db.Update(func(tx *bolt.Tx) (err error) {
-				bucket, err := tx.CreateBucketIfNotExists(cacheUsageByTime)
-				if err != nil {
-					return
-				}
-				key := make([]byte, binary.MaxVarintLen64)
-				key = key[:binary.PutVarint(key, time.Now().UnixNano())]
-				key = append(key, []byte(self.Id)...)
-				if err = bucket.Put(key, []byte{0}); err != nil {
-					return
-				}
-				return
-			}); err != nil {
+			if err = self.futon.db.Update(self.saveUsage); err != nil {
 				return
 			}
-			self.futon.debug("Returning %v bytes (block size %v) of block %v of %v after loading from bolt", len(result), blockSize, n, self.Path)
 		}
 		return
 	}
@@ -414,12 +383,12 @@ func (self *node) loadBlock(n int64, tries int) (result []byte, err error) {
 		return
 	}
 	if err = self.futon.db.Update(func(tx *bolt.Tx) (err error) {
-		blocksByPath, err := tx.CreateBucketIfNotExists(blocksByPath)
+		blocksById, err := tx.CreateBucketIfNotExists(blocksById)
 		if err != nil {
-			self.futon.fatal("While trying to create blocksByPath bucket: %v", err)
+			self.futon.fatal("While trying to create blocksById bucket: %v", err)
 			return
 		}
-		myBlocks, err := blocksByPath.CreateBucketIfNotExists([]byte(self.Id))
+		myBlocks, err := blocksById.CreateBucketIfNotExists([]byte(self.Id))
 		if err != nil {
 			self.futon.fatal("While trying to create myBlocks bucket: %v", err)
 			return
@@ -428,13 +397,28 @@ func (self *node) loadBlock(n int64, tries int) (result []byte, err error) {
 			self.futon.fatal("While trying to store block %v of %v: %v", n, self.Path, err)
 			return
 		}
-		self.futon.debug("Stored block %v of %v in bolt", n, self.Path)
-		self.futon.info("Total blocks: %v, file blocks: %v", blocksByPath.Stats().KeyN, myBlocks.Stats().KeyN)
+		if err = self.saveUsage(tx); err != nil {
+			return
+		}
+		if cacheUsageByTime := tx.Bucket(cacheUsageByTime); cacheUsageByTime != nil {
+			if int64(blocksById.Stats().KeyN)*blockSize > self.futon.maxCache {
+				cursor := cacheUsageByTime.Cursor()
+				for usageKey, oldestId := cursor.First(); usageKey != nil && int64(blocksById.Stats().KeyN)*blockSize > self.futon.maxCache; usageKey, oldestId = cursor.Next() {
+					if err = blocksById.DeleteBucket(oldestId); err != nil {
+						self.futon.fatal("While trying to delete block bucket for %s: %v", oldestId, err)
+						return
+					}
+					if err = cacheUsageByTime.Delete(usageKey); err != nil {
+						self.futon.fatal("While trying to delete usage marker for %s: %v", oldestId, err)
+						return
+					}
+				}
+			}
+		}
 		return
 	}); err != nil {
 		return
 	}
-	self.futon.debug("Returning %v bytes (block size %v) of block %v of %v after loading from Drive", len(result), blockSize, n, self.Path)
 	return
 }
 
@@ -452,7 +436,35 @@ type buckets struct {
 	nodePathById     *bolt.Bucket
 	nodeByPath       *bolt.Bucket
 	childPathsByPath *bolt.Bucket
-	blocksByPath     *bolt.Bucket
+	blocksById       *bolt.Bucket
+}
+
+func (b buckets) saveNode(self *node) (err error) {
+	data, err := json.Marshal(self)
+	if err != nil {
+		self.futon.fatal("While trying to JSON encode %+v: %v", self, err)
+		return
+	}
+	if err = b.nodeByPath.Put(self.Path.marshal(), data); err != nil {
+		self.futon.fatal("While trying to save %+v: %v", self, err)
+		return
+	}
+	if err = b.nodePathById.Put([]byte(self.Id), self.Path.marshal()); err != nil {
+		self.futon.fatal("While trying to save %#v: %v", self.Path, err)
+		return
+	}
+	if len(self.Path) > 0 {
+		var bucket *bolt.Bucket
+		if bucket, err = b.childPathsByPath.CreateBucketIfNotExists(self.Path.parent().marshal()); err != nil {
+			self.futon.fatal("While trying to create child bucket for %+v: %v", self, err)
+			return
+		}
+		if err = bucket.Put(self.Path.marshal(), []byte{0}); err != nil {
+			self.futon.fatal("While trying to save %#v: %v", self.Path, err)
+			return
+		}
+	}
+	return
 }
 
 func (self buckets) removeNode(id []byte) (err error) {
@@ -462,6 +474,13 @@ func (self buckets) removeNode(id []byte) (err error) {
 		(&p).unmarshal(pathData)
 		if err = self.nodePathById.Delete(id); err != nil {
 			self.futon.fatal("While trying to delete %#v: %v", string(id), err)
+			return
+		}
+		nodeData := self.nodeByPath.Get(pathData)
+		n := &node{
+			futon: self.futon,
+		}
+		if err = json.Unmarshal(nodeData, n); err != nil {
 			return
 		}
 		if err = self.nodeByPath.Delete(pathData); err != nil {
@@ -474,9 +493,14 @@ func (self buckets) removeNode(id []byte) (err error) {
 				return
 			}
 		}
-		if err = self.blocksByPath.DeleteBucket(id); err != nil {
+		if err = self.blocksById.DeleteBucket(id); err != nil {
 			self.futon.fatal("While trying to delete blocks for %#v: %v", string(id), err)
 			return
+		}
+		if cacheUsageByTime := self.tx.Bucket(cacheUsageByTime); cacheUsageByTime != nil {
+			if err = cacheUsageByTime.Delete(n.cacheUsageKey()); err != nil {
+				return
+			}
 		}
 		self.futon.debug("%s was removed", p)
 	}
@@ -566,26 +590,30 @@ func (self *Futon) changeList() (result []*drive.Change, err error) {
 	return
 }
 
-func (self *Futon) buckets(tx *bolt.Tx) (result buckets, err error) {
-	result.tx = tx
-	result.futon = self
-	if result.nodePathById, err = tx.CreateBucketIfNotExists(nodePathById); err != nil {
-		self.fatal("While trying to create nodePathById bucket: %v", err)
-		return
-	}
-	if result.nodeByPath, err = tx.CreateBucketIfNotExists(nodeByPath); err != nil {
-		self.fatal("While trying to create nodeByPath bucket: %v", err)
-		return
-	}
-	if result.childPathsByPath, err = tx.CreateBucketIfNotExists(childPathsByPath); err != nil {
-		self.fatal("While trying to create childPathsByPath bucket: %v", err)
-		return
-	}
-	if result.blocksByPath, err = tx.CreateBucketIfNotExists(blocksByPath); err != nil {
-		self.fatal("While trying to create blocksByPath bucket: %v", err)
-		return
-	}
-	return
+func (self *Futon) withBuckets(f func(buckets) error) (err error) {
+	return self.db.Update(func(tx *bolt.Tx) (err error) {
+		b := buckets{
+			futon: self,
+			tx:    tx,
+		}
+		if b.nodePathById, err = tx.CreateBucketIfNotExists(nodePathById); err != nil {
+			self.fatal("While trying to create nodePathById bucket: %v", err)
+			return
+		}
+		if b.nodeByPath, err = tx.CreateBucketIfNotExists(nodeByPath); err != nil {
+			self.fatal("While trying to create nodeByPath bucket: %v", err)
+			return
+		}
+		if b.childPathsByPath, err = tx.CreateBucketIfNotExists(childPathsByPath); err != nil {
+			self.fatal("While trying to create childPathsByPath bucket: %v", err)
+			return
+		}
+		if b.blocksById, err = tx.CreateBucketIfNotExists(blocksById); err != nil {
+			self.fatal("While trying to create blocksById bucket: %v", err)
+			return
+		}
+		return f(b)
+	})
 }
 
 func (self *Futon) mergeChanges() (err error) {
@@ -597,8 +625,7 @@ func (self *Futon) mergeChanges() (err error) {
 	if err != nil {
 		return
 	}
-	if err = self.db.Update(func(tx *bolt.Tx) (err error) {
-		b, err := self.buckets(tx)
+	if err = self.withBuckets(func(b buckets) (err error) {
 		for _, change := range changes {
 			if change.File.Labels.Trashed {
 				if err = b.removeNode([]byte(change.File.Id)); err != nil {
@@ -610,11 +637,10 @@ func (self *Futon) mergeChanges() (err error) {
 					if pathData != nil {
 						p := path{}
 						(&p).unmarshal(pathData)
-						n := self.newNode(p.add(change.File.Title), change.File)
-						if err = n.rawSave(tx); err != nil {
+						if err = b.saveNode(self.newNode(p.add(change.File.Title), change.File)); err != nil {
 							return
 						}
-						self.debug("%v was updated", n.Path)
+						self.debug("%v was updated", p.add(change.File.Title))
 					}
 				}
 			}
@@ -776,7 +802,9 @@ func (self *Futon) root() (result *node, err error) {
 		Id:    self.RootFolderId,
 		Mode:  0500 | os.ModeDir,
 	}
-	if err = result.save(); err != nil {
+	if err = self.withBuckets(func(b buckets) (err error) {
+		return b.saveNode(result)
+	}); err != nil {
 		return
 	}
 	return
@@ -819,6 +847,11 @@ func (self *Futon) log(format string, params ...interface{}) {
 	if self.logger != nil {
 		self.logger.Printf(fmt.Sprintf("%v\t%v\t%v", "futon", time.Now(), format), params...)
 	}
+}
+
+func (self *Futon) MaxCache(i int64) *Futon {
+	self.maxCache = i
+	return self
 }
 
 func (self *Futon) Logger(l *log.Logger) *Futon {
