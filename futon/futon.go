@@ -1,6 +1,7 @@
 package futon
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -28,6 +29,7 @@ import (
 var nodeByPath = []byte("nodeByPath")
 var nodePathById = []byte("nodePathById")
 var childPathsByPath = []byte("childPathsByPath")
+var blocksByPath = []byte("blocksByPath")
 
 // Settings for authorization.
 var config = &oauth.Config{
@@ -223,6 +225,10 @@ func (self *node) Lookup(name string, intr fs.Intr) (result fs.Node, ferr fuse.E
 		ferr = fuse.Error(err)
 		return
 	}
+	if err := self.createChildren(); err != nil {
+		ferr = fuse.Error(err)
+		return
+	}
 	if err := self.futon.db.View(func(tx *bolt.Tx) (err error) {
 		if bucket := tx.Bucket(nodeByPath); bucket != nil {
 			if data := bucket.Get(self.Path.add(name).marshal()); data != nil {
@@ -271,7 +277,6 @@ func (self *node) ReadDir(intr fs.Intr) (result []fuse.Dirent, ferr fuse.Error) 
 			ent.Type = fuse.DT_File
 		} else {
 			ent.Type = fuse.DT_Dir
-			go child.createChildren()
 		}
 		result[index] = ent
 	}
@@ -293,8 +298,63 @@ func (self *node) getDownloadUrl() (result string, err error) {
 	return
 }
 
-func (self *node) read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, tries int) (ferr fuse.Error) {
+const (
+	blockSize = 1 << 19
+)
+
+func (self *node) read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse) (err error) {
 	if self.Size == 0 {
+		return
+	}
+	readResp.Data = make([]byte, readReq.Size)
+	firstBlock := readReq.Offset / blockSize
+	lastBlock := (readReq.Offset + int64(readReq.Size)) / blockSize
+	blockOffset := readReq.Offset % blockSize
+	self.futon.debug("Loading %v bytes from %v of %v entails loading blocks from %v to %v", readReq.Size, readReq.Offset, self.Path, firstBlock, lastBlock)
+	var block []byte
+	copied := 0
+	for i := firstBlock; i <= lastBlock; i++ {
+		if block, err = self.loadBlock(i, 0); err != nil {
+			return
+		}
+		dst := readResp.Data[copied:]
+		if len(block) < int(blockOffset) {
+			self.futon.fatal("block %v of %v is %v long, but our blockOffset is %v", i, self.Path, len(block), blockOffset)
+		}
+		src := block[blockOffset:]
+		copy(dst, src)
+		if len(dst) > len(src) {
+			copied += len(src)
+		} else {
+			copied += len(dst)
+		}
+		blockOffset = 0
+	}
+	return
+}
+
+func (self *node) blockKey(n int64) (result []byte) {
+	result = make([]byte, binary.MaxVarintLen64)
+	result = result[:binary.PutVarint(result, n)]
+	return
+}
+
+func (self *node) loadBlock(n int64, tries int) (result []byte, err error) {
+	if err = self.futon.db.View(func(tx *bolt.Tx) (err error) {
+		if blocksByPath := tx.Bucket(blocksByPath); blocksByPath != nil {
+			if myBlocks := blocksByPath.Bucket([]byte(self.Id)); myBlocks != nil {
+				block := myBlocks.Get(self.blockKey(n))
+				if block != nil {
+					result = make([]byte, len(block))
+					copy(result, block)
+				}
+			}
+		}
+		return
+	}); err != nil || result != nil {
+		if result != nil {
+			self.futon.debug("Returning %v bytes (block size %v) of block %v of %v after loading from bolt", len(result), blockSize, n, self.Path)
+		}
 		return
 	}
 	downloadUrl, err := self.getDownloadUrl()
@@ -307,40 +367,66 @@ func (self *node) read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, t
 	req, err := http.NewRequest("GET", downloadUrl, nil)
 	if err != nil {
 		self.futon.fatal("While trying to create GET request for %#v: %v", downloadUrl, err)
-		ferr = fuse.Error(err)
 		return
 	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%v-%v", readReq.Offset, readReq.Offset+int64(readReq.Size)-1))
-	self.futon.debug("Loading bytes %v-%v of %v", readReq.Offset, readReq.Offset+int64(readReq.Size)-1, self.Path)
+	end := blockSize*(n+1) - 1
+	if end > self.Size-1 {
+		end = self.Size - 1
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%v-%v", blockSize*n, end))
+	self.futon.debug("Loading bytes %v-%v of %v", blockSize*n, end, self.Path)
 	resp, err := self.futon.client.Do(req)
 	if err != nil {
 		self.futon.fatal("While trying to perform %+v: %v", req, err)
-		ferr = fuse.Error(err)
 		return
 	}
-	self.futon.debug("Done loading bytes %v-%v of %v", readReq.Offset, readReq.Offset+int64(readReq.Size)-1, self.Path)
+	self.futon.debug("Done loading bytes %v-%v of %v", blockSize*n, end, self.Path)
 	if resp.StatusCode > 400 && resp.StatusCode < 404 {
 		self.downloadUrl = ""
 		if tries < 5 {
-			return self.read(readReq, readResp, tries+1)
+			return self.loadBlock(n, tries+1)
 		}
 	}
 	if resp.StatusCode != 206 {
 		log.Printf("%+v", resp)
-		ferr = fuse.Error(fmt.Errorf("While trying to download %#v: %+v", downloadUrl, resp))
+		err = fmt.Errorf("While trying to download %#v: %+v", downloadUrl, resp)
 		return
 	}
 	defer resp.Body.Close()
-	if readResp.Data, err = ioutil.ReadAll(resp.Body); err != nil {
+	if result, err = ioutil.ReadAll(resp.Body); err != nil {
 		self.futon.fatal("While trying to read the body of %+v: %v", resp, err)
-		ferr = fuse.Error(err)
 		return
 	}
+	if err = self.futon.db.Update(func(tx *bolt.Tx) (err error) {
+		blocksByPath, err := tx.CreateBucketIfNotExists(blocksByPath)
+		if err != nil {
+			self.futon.fatal("While trying to create blocksByPath bucket: %v", err)
+			return
+		}
+		myBlocks, err := blocksByPath.CreateBucketIfNotExists([]byte(self.Id))
+		if err != nil {
+			self.futon.fatal("While trying to create myBlocks bucket: %v", err)
+			return
+		}
+		if err = myBlocks.Put(self.blockKey(n), result); err != nil {
+			self.futon.fatal("While trying to store block %v of %v: %v", n, self.Path, err)
+			return
+		}
+		self.futon.debug("Stored block %v of %v in bolt", n, self.Path)
+		return
+	}); err != nil {
+		return
+	}
+	self.futon.debug("Returning %v bytes (block size %v) of block %v of %v after loading from Drive", len(result), blockSize, n, self.Path)
 	return
 }
 
 func (self *node) Read(readReq *fuse.ReadRequest, readResp *fuse.ReadResponse, intr fs.Intr) (ferr fuse.Error) {
-	return self.read(readReq, readResp, 0)
+	if err := self.read(readReq, readResp); err != nil {
+		ferr = fuse.Error(err)
+		return
+	}
+	return
 }
 
 type Futon struct {
