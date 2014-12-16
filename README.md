@@ -2,6 +2,10 @@
 
 Google Drive on FUSE
 
+* Right now, and probably forever, read only.
+* Caches everything it fetches from Drive in a bolt db.
+* Throws out cached files when the sum of cached blocks overflows a max cache size.
+
 ## Usage
 
 ```
