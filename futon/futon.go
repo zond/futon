@@ -536,6 +536,10 @@ func (self *Futon) mergeChanges() (err error) {
 			self.fatal("While trying to create childPathsByPath bucket: %v", err)
 			return
 		}
+		blocksByPath, err := tx.CreateBucketIfNotExists(blocksByPath)
+		if err != nil {
+			return
+		}
 		for _, change := range changes {
 			if change.File.Labels.Trashed {
 				pathData := nodePathById.Get([]byte(change.File.Id))
@@ -555,6 +559,9 @@ func (self *Futon) mergeChanges() (err error) {
 							self.fatal("While trying to delete %s: %v", p.marshal(), err)
 							return
 						}
+					}
+					if err = blocksByPath.DeleteBucket([]byte(change.File.Id)); err != nil {
+						return
 					}
 					self.debug("%s was removed", p)
 				}
